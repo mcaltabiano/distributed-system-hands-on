@@ -1,0 +1,3 @@
+# SSL certificates – drop your corporate CA bundle here, never commit it
+certs/*.crt
+certs/*.pem

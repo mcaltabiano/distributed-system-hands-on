@@ -10,13 +10,10 @@ Teoria e pratica per un affondo su architetture distribuite event driven e patte
 
 1. [Il Teorema CAP](#1-il-teorema-cap)
 2. [PACELC — L'estensione pratica del CAP](#2-pacelc--lestensione-pratica-del-cap)
-3. [Tecnologie — Zona CP](#3-tecnologie--zona-cp)
-4. [Tecnologie — Zona AP](#4-tecnologie--zona-ap)
-5. [Message Broker](#5-message-broker)
-6. [HBase e la consistency forte (EC)](#6-hbase-e-la-consistency-forte-ec)
-7. [Algoritmo Raft](#7-algoritmo-raft)
-8. [Modelli di Consistency](#8-modelli-di-consistency)
-9. [Progetto Pratico — E-commerce Event-Driven](#9-progetto-pratico--e-commerce-event-driven)
+3. [Kafka e il modello CP](#3-kafka-e-il-modello-cp)
+4. [Algoritmo Raft](#4-algoritmo-raft)
+5. [Modelli di Consistency](#5-modelli-di-consistency)
+6. [Progetto Pratico — E-commerce Event-Driven](#6-progetto-pratico--e-commerce-event-driven)
 
 ---
 
@@ -51,17 +48,7 @@ In presenza di un database replicato su 3 nodi si dispone di due strade:
 
 **Scelta EL (bassa latenza):** si scrive sul nodo locale, si risponde subito al client, si propagano i dati ai replica in background. Risposta in ~1ms, ma una lettura immediata da un altro nodo potrebbe restituire il dato vecchio.
 
-**Scelta EC (consistency forte):** si attende che almeno 2 nodi su 3 confermino la write (quorum). Il client attende ~10-50ms in più, ma chiunque legga da qualsiasi nodo vedrà il dato aggiornato.
-
-### Classificazione combinata PAC/ELC
-
-| Sistema | Durante partizione | Operazione normale | Nota |
-|---|---|---|---|
-| Cassandra | PA (risponde sempre) | EL (write locale) | Tunable |
-| DynamoDB | PA (eventual cons.) | EL o EC | Configurabile per read |
-| HBase | PC (blocca) | EC (strong read) | ZooKeeper-based |
-| ZooKeeper | PC (blocca) | EC | Coordinamento |
-| Spanner | PC (blocca) | EC | TrueTime |
+**Scelta EC (consistency forte):** si attende che almeno 2 nodi su 3 confermino la write (quorum). Il client attende ~10-50ms in più, ma chiunque legga da qualsiasi nodo vedrà il dato aggiornato. Questo è esattamente ciò che Raft implementa: una entry del log è committata solo dopo che la **maggioranza** dei nodi ha risposto.
 
 ### Applicazione pratica nel progetto e-commerce
 
@@ -73,114 +60,19 @@ In presenza di un database replicato su 3 nodi si dispone di due strade:
 
 ---
 
-## 3. Tecnologie — Zona CP
+## 3. Kafka e il modello CP
 
-Questi sistemi, di fronte a una partizione di rete, **rifiutano di rispondere** piuttosto che restituire dati potenzialmente stale. Il pattern comune è il **consensus algorithm** (Raft o Paxos): prima di confermare una write, la maggioranza dei nodi deve essere d'accordo.
+Kafka non gestisce lo stato applicativo come un database, ma **trasporta eventi**. Il suo posizionamento CP/AP dipende dalla configurazione del producer.
 
-### ZooKeeper / etcd
-Casi più puri di CP. Utilizzati per coordinamento distribuito: leader election, distributed lock, configurazione condivisa. `etcd` è il cuore di Kubernetes. Non vengono impiegati come database principale, ma come "arbitri" di sistema.
+Con `acks=all` Kafka si comporta come **CP**: il producer non riceve conferma finché tutti i replica in-sync (ISR) non hanno scritto il messaggio. Zero perdita di messaggi, latenza più alta. È la configurazione indicata per sistemi finanziari o ovunque un messaggio perso costituisca un problema grave.
 
-### HBase
-Database columnar su HDFS. La consistency è garantita da ZooKeeper internamente. Ottimo per carichi write-heavy ad alta scalabilità. Se il RegionServer perde il contatto con ZooKeeper, smette di servire richieste.
+Con `acks=1` o `acks=0` il producer riceve conferma prima che i replica si allineino — più vicino ad AP, con rischio di perdita dati in caso di crash del leader.
 
-### MongoDB (default)
-Configurabile. Di default è CP (`writeConcern: majority`), ma è possibile abbassare la garanzia avvicinandosi ad AP. Questo pattern si chiama **tunable consistency**.
+Nel progetto il broker è configurato in modalità KRaft: Kafka gestisce internamente il proprio cluster metadata tramite l'**algoritmo Raft** (descritto nella sezione successiva), eliminando la dipendenza da ZooKeeper. Il `kafka-init` crea i topic esplicitamente con replication factor 1 — scelta deliberata per il laboratorio locale, non per la produzione.
 
 ---
 
-## 4. Tecnologie — Zona AP
-
-Di fronte a una partizione, questi sistemi **continuano a rispondere** accettando che alcuni nodi abbiano dati non aggiornati. Il prezzo è la **eventual consistency**: prima o poi tutti i nodi convergeranno allo stesso stato.
-
-### Cassandra
-Il caso di studio più didattico. Il livello di quorum è regolabile per ogni operazione:
-
-```sql
-CONSISTENCY ONE    -- massimamente AP
-CONSISTENCY QUORUM -- compromesso (maggioranza)
-CONSISTENCY ALL    -- diventa CP
-```
-
-La formula chiave: `R + W > N` per ottenere consistency (dove N = numero di repliche).
-
-### DynamoDB
-Offre due modalità di lettura esplicite:
-- *Eventually consistent reads* — default, più veloci e meno costose
-- *Strongly consistent reads* — costo e latenza maggiori, ma dato sempre aggiornato
-
-### CouchDB
-L'esempio estremo di AP: supporta **multi-master replication** — è possibile scrivere contemporaneamente su nodi diversi. I conflitti vengono risolti deterministicamente in un secondo momento (approccio CRDT-like).
-
----
-
-## 5. Message Broker
-
-I broker non gestiscono lo stato applicativo come i database, ma **trasportano eventi**. Il CAP si applica in modo diverso rispetto ai sistemi di storage.
-
-| Broker | Posizione CAP | Caratteristica chiave |
-|---|---|---|
-| **Kafka** con `acks=all` | CP | Il producer attende conferma da tutti i replica. Zero perdita messaggi, latenza più alta |
-| **RabbitMQ** | AP | Prioritizza disponibilità e throughput. Riconciliazione post-split |
-| **Redis Streams** | AP / leggero | Adatto a use case a bassa latenza e volumi moderati |
-| **Apache Pulsar** | CP | Separa storage (BookKeeper, CP) da compute. Alternativa moderna a Kafka |
-
-### Criteri di scelta
-
-Kafka con `acks=all` è la scelta indicata per sistemi finanziari o ovunque un messaggio perso costituisca un problema grave. RabbitMQ è più semplice da operare per task queue e notifiche. Redis Streams è appropriato quando Redis è già presente nell'architettura e i volumi sono moderati.
-
----
-
-## 6. HBase e la consistency forte (EC)
-
-HBase non implementa la consistency in autonomia — la **delega interamente a ZooKeeper**.
-
-### Architettura
-
-```
-Client
-  │
-  ├── ZooKeeper (3-5 nodi)       ← "chi comanda?"
-  │         │
-  │    HMaster (1 attivo)        ← coordinamento, DDL
-  │
-  └── RegionServer A  B  C
-            │
-       [Region 1]  [Region 2]    ← ogni row key → una sola Region
-```
-
-**Il punto cruciale:** ogni riga appartiene a una e una sola Region, servita da un solo RegionServer. Non esistono repliche attive che possono divergere, eliminando il problema "quale nodo ha il dato più aggiornato".
-
-### Percorso di una write e costo in latenza
-
-1. **Client → ZooKeeper** (~1-2ms) — lookup del RegionServer responsabile (cachato)
-2. **Client → RegionServer** (~1ms) — la write arriva al nodo responsabile
-3. **Write-Ahead Log su HDFS** (~5-20ms) ← **il costo principale** — attende ACK da 2/3 DataNode
-4. **MemStore in memoria** — parallelamente al WAL; le letture successive risultano molto veloci
-5. **ACK al client** — emesso solo dopo la conferma della replica HDFS
-
-```
-write client
-    │
-    ├──► WAL → HDFS node 1 ──► ACK ┐
-    │         → HDFS node 2 ──► ACK ┘  (2/3 ok) → ACK al client
-    │         → HDFS node 3 ──► (non atteso)
-    │
-    └──► MemStore (in-memory, immediato)
-```
-
-### Latenze tipiche
-
-| Operazione | Latenza | Causa |
-|---|---|---|
-| Write con WAL | 5–20ms | Attesa replica HDFS |
-| Write senza WAL (`SKIP_WAL`) | <1ms | Solo MemStore, rischio perdita dati |
-| Read da MemStore | 1–5ms | In memoria |
-| Read da HFile | 10–50ms | Disco + HDFS |
-| Read durante flush/compaction | 50–200ms | RegionServer overload |
-
----
-
-## 7. Algoritmo Raft
+## 4. Algoritmo Raft
 
 Raft (Ongaro & Ousterhout, 2014) è stato progettato con un obiettivo esplicito: essere **comprensibile**. Risolve il problema fondamentale dei sistemi distribuiti: come fanno N nodi a mettersi d'accordo su una sequenza di valori, anche se alcuni nodi crashano o la rete si interrompe?
 
@@ -225,18 +117,15 @@ Ogni entry è identificata da `(index, term)`. Il leader verifica sempre l'entry
 | **Log Matching** | Se due log hanno la stessa entry allo stesso indice, sono identici su tutti gli indici precedenti |
 | **Leader Completeness** | Un leader del term T contiene tutte le entry committate nei term precedenti |
 
-### Raft vs Paxos
+### Collegamento al progetto
 
-Paxos è più generale (consensus su singoli valori) ma non specifica come costruire un log replicato completo — ogni implementazione riempie i buchi in modo differente. Raft è invece progettato esplicitamente per un log replicato, con leader election, membership changes e snapshot tutti definiti nel paper originale.
-
-**Usano Raft:** etcd, CockroachDB, TiKV, Consul.
-**Usano Paxos:** Google Chubby, Spanner (sviluppati prima di Raft).
+In KRaft mode, `KAFKA_CONTROLLER_QUORUM_VOTERS` definisce i nodi con diritto di voto nell'elezione Raft. In produzione si usano 3 o 5 controller per tollerare 1 o 2 failure; nel laboratorio il quorum è formato da un solo nodo — sufficiente per sperimentare, zero fault tolerance. L'esperimento della Fase 4 (`docker stop kafka`) permette di osservare direttamente cosa accade al cluster durante un failover del leader.
 
 ---
 
-## 8. Modelli di Consistency
+## 5. Modelli di Consistency
 
-I modelli di consistency rappresentano lo strato che il codice applicativo tocca direttamente. Non descrivono *come* i nodi si sincronizzano (questo è compito di Raft, WAL, quorum) — descrivono **cosa vede il client** dopo una write.
+I modelli di consistency descrivono **cosa vede il client** dopo una write. Non descrivono *come* i nodi si sincronizzano — quello è compito di Raft e del WAL di PostgreSQL — descrivono il contratto esposto all'applicazione.
 
 La domanda centrale è sempre la stessa: se si scrive un valore sul nodo A, quando lo vede il client che legge dal nodo B?
 
@@ -251,20 +140,7 @@ Client B:  legge da qualsiasi nodo → x=10 ✓ (immediatamente)
 ```
 
 **Costo:** alta latenza, bassa disponibilità in caso di partizione.
-**Esempi:** etcd, ZooKeeper, Spanner, CockroachDB.
-**Casi d'uso:** leader election, distributed lock, sequencer di ID.
-
----
-
-#### Sequential Consistency
-Tutte le operazioni appaiono in un ordine globale consistente, ma quell'ordine non deve necessariamente corrispondere al tempo reale. Client diversi vedono lo stesso ordine, pur potendo non essere aggiornati al momento presente.
-
-```
-Client A:  write x=10 → write x=20
-Client B:  read x=10 → read x=20  (mai 20 → 10) ✓
-```
-
-**Esempi:** ZooKeeper per operazioni di watch. Modello prevalentemente teorico.
+**Nel progetto:** il lock `SELECT FOR UPDATE` dell'Inventory Service garantisce linearizability sulla sottrazione dello stock.
 
 ---
 
@@ -277,8 +153,7 @@ Client B:  vede il post, poi la reply — mai al contrario ✓
 ```
 
 **Costo:** implementazione complessa (vector clock o simili).
-**Esempi:** MongoDB causal sessions, alcune configurazioni Cassandra.
-**Casi d'uso:** social feed, commenti, chat.
+**Nel progetto:** la choreography Saga garantisce causalità tra eventi — `inventory.reserved` non può essere processato prima di `order.placed`.
 
 ---
 
@@ -290,8 +165,7 @@ Client A:  write bio="Dev" → read bio="Dev" ✓
 Client B:  read bio=""  (stale accettabile per altri client)
 ```
 
-**Esempi:** DynamoDB con sticky sessions, PostgreSQL read replicas con routing.
-**Casi d'uso:** profilo utente, impostazioni, "aggiorna e rileggi subito".
+**Nel progetto:** PostgreSQL con connessione dedicata per servizio garantisce questa proprietà nativamente — ogni servizio legge il proprio nodo, non una replica.
 
 ---
 
@@ -303,12 +177,10 @@ Client A:  read x=10 → read x=10 → read x=20 ✓
 Senza garanzia: read x=10 → read x=5 ✗ (possibile con load balancer)
 ```
 
-**Esempi:** Cassandra con timestamp tracking, sistemi con vector clock lato client.
-
 ---
 
 #### Eventual Consistency
-Se le write si interrompono, tutti i nodi convergeranno eventualmente allo stesso valore. Non esiste garanzia su *quando* avvenga la convergenza né su cosa sia visibile nel frattempo. È la promessa minima che un sistema distribuito AP può offrire.
+Se le write si interrompono, tutti i nodi convergeranno eventualmente allo stesso valore. Non esiste garanzia su *quando* avvenga la convergenza né su cosa sia visibile nel frattempo. È la promessa minima che un sistema AP può offrire.
 
 ```
 Client A:  write x=10
@@ -316,25 +188,24 @@ Client B:  read x=0 → read x=0 → ... → read x=10 ✓ (prima o poi)
 ```
 
 **Costo:** anomalie visibili al client, richiede idempotenza nei consumer.
-**Esempi:** Cassandra (ONE), DynamoDB (eventually consistent reads), DNS, CDN.
-**Casi d'uso:** contatori like/view, notifiche, cache, ricerche non critiche.
+**Nel progetto:** il Notification Service usa Redis con questo modello — un'email duplicata o in ritardo di qualche secondo è accettabile.
 
 > **Il tranello più comune:** eventual consistency non significa "dati sbagliati". Significa che esiste una *finestra di inconsistency* che si chiude nel tempo — tipicamente millisecondi o secondi nei sistemi moderni. Il problema emerge quando il codice assume linearizability su un sistema che garantisce solo eventual.
 
 ### Come si combinano nella pratica
 
-I modelli non si escludono — si **impilano per operazione**. In un e-commerce è comune trovare modelli diversi all'interno dello stesso sistema:
+I modelli non si escludono — si **impilano per operazione**. Nel progetto e-commerce:
 
-| Operazione | Modello | Motivazione |
+| Operazione | Modello | Implementazione |
 |---|---|---|
-| Sottrazione inventario | Linearizability | Non è possibile oversellare |
-| Aggiornamento profilo utente | Read-your-writes | L'utente si aspetta di vedere subito le proprie modifiche |
-| Contatore visualizzazioni prodotto | Eventual | Un dato leggermente stale è accettabile |
-| Thread commenti | Causal | La risposta deve comparire dopo il post originale |
+| Sottrazione inventario | Linearizability | `SELECT FOR UPDATE` su PostgreSQL |
+| Aggiornamento profilo utente | Read-your-writes | Connessione dedicata al nodo primario |
+| Notifica email | Eventual | Redis + Notification Service AP |
+| Sequenza eventi Saga | Causal | Ordinamento garantito dai topic Kafka |
 
 ---
 
-## 9. Progetto Pratico — E-commerce Event-Driven
+## 6. Progetto Pratico — E-commerce Event-Driven
 
 ### Obiettivo didattico
 
@@ -395,7 +266,7 @@ Il concetto di partizione di rete si comprende appieno non leggendone la definiz
 
 ```
 ecommerce-distributed/
-├── docker-compose.yml              ← Kafka, Zookeeper, PostgreSQL x2, Redis
+├── docker-compose.yml              ← Kafka, PostgreSQL x3, Redis
 ├── services/
 │   ├── order-service/              ← Python/FastAPI
 │   │   ├── main.py
@@ -426,7 +297,61 @@ ecommerce-distributed/
 | **3** | Payment con idempotency + Saga | Eventual consistency, eventi compensativi |
 | **4** | Partition simulator + osservazioni | CAP in pratica, PACELC vissuto |
 
-### Esperimenti da eseguire nella Fase 4
+### Comandi per fase
+
+#### Fase 1 — Infrastruttura e Kafka
+
+```bash
+# Build di tutte le immagini dei servizi applicativi
+docker compose build
+
+# Avvia Kafka e attendi che kafka-init crei i topic
+docker compose up -d kafka kafka-init
+
+# Segui i log di init per confermare la creazione dei topic
+docker compose logs -f kafka-init
+
+# Verifica che i topic siano presenti
+docker compose exec kafka kafka-topics --bootstrap-server localhost:9092 --list
+```
+
+#### Fase 2 — Order Service + Inventory Service
+
+```bash
+# Avvia i database e i due servizi
+docker compose up -d postgres-orders postgres-inventory order-service inventory-service
+
+# Controlla che tutti i container siano healthy
+docker compose ps
+
+# Piazza un ordine di test
+curl -X POST http://localhost:8001/orders \
+  -H "Content-Type: application/json" \
+  -d '{"product_id": "abc", "quantity": 1}'
+
+# Osserva la riserva dell'inventario in tempo reale
+docker compose logs -f order-service inventory-service
+```
+
+#### Fase 3 — Payment Service + Notification Service (Saga completa)
+
+```bash
+# Avvia i servizi rimanenti
+docker compose up -d postgres-payments redis payment-service notification-service
+
+# Verifica che tutto lo stack sia up
+docker compose ps
+
+# Piazza un ordine e osserva l'intera catena Saga
+curl -X POST http://localhost:8001/orders \
+  -H "Content-Type: application/json" \
+  -d '{"product_id": "abc", "quantity": 1}'
+
+# Segui tutti i servizi in parallelo
+docker compose logs -f order-service inventory-service payment-service notification-service
+```
+
+#### Fase 4 — Partition simulator e osservazioni
 
 ```bash
 # Simula una partizione sul servizio inventario
@@ -443,13 +368,23 @@ docker network connect ecommerce-net inventory-service
 ```
 
 ```bash
-# Simula la morte del leader Kafka
-docker stop kafka-broker-1
+# Simula la morte del leader Kafka (Raft leader election in azione)
+docker stop kafka
 
 # Osservazioni attese:
 # - Quanto tempo impiega il cluster a eleggere un nuovo leader?
 # - Cosa riceve il producer durante il failover?
 # - Gli ordini in volo vengono persi o ritrasmessi?
+```
+
+#### Teardown
+
+```bash
+# Ferma tutti i container
+docker compose down
+
+# Ferma e rimuove i volumi (azzera lo stato dei database)
+docker compose down -v
 ```
 
 ### Letture consigliate
@@ -464,4 +399,18 @@ docker stop kafka-broker-1
 
 ---
 
-*Roadmap: CAP → PACELC → Tecnologie → HBase/EC → Raft → Modelli di Consistency → Progetto pratico*
+*Roadmap: CAP → PACELC → Kafka CP → Raft → Modelli di Consistency → Progetto pratico*
+
+---
+
+## Certificati SSL aziendali
+
+Se `docker compose build` fallisce durante `pip install` con errori SSL (tipico dietro un proxy aziendale con ispezione HTTPS), crea una cartella `certs/` nella root del repository e inserisci il certificato CA in formato `.crt`:
+
+```bash
+mkdir certs
+cp /percorso/del/tuo/certificato.crt certs/
+docker compose build
+```
+
+I certificati vengono montati nei container **solo durante la fase di build** tramite BuildKit bind mount — non vengono mai copiati nelle immagini finali. La cartella `certs/` è già in `.gitignore`.
