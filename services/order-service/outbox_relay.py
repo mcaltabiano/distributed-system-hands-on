@@ -70,7 +70,7 @@ async def _process_batch(pool: asyncpg.Pool, producer: Producer) -> None:
 
         published_ids = []
         for row in rows:
-            payload_bytes = json.dumps(dict(row["payload"])).encode()
+            payload_bytes = row["payload"].encode()
             producer.produce(
                 topic=row["topic"],
                 key=row["key"].encode() if row["key"] else None,

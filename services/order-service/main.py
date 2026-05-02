@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import uuid
 
@@ -46,7 +47,7 @@ async def create_order(req: OrderRequest):
             # The relay picks this up and publishes to Kafka independently.
             await conn.execute(
                 "INSERT INTO outbox (topic, key, payload) VALUES ($1, $2, $3::jsonb)",
-                "order.placed", str(order_id), str(payload).replace("'", '"'),
+                "order.placed", str(order_id), json.dumps(payload),
             )
 
     return OrderResponse(
