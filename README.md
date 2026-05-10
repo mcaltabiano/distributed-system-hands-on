@@ -242,6 +242,118 @@ Il progetto non mira a costruire un e-commerce di produzione, ma a realizzare un
 
 **Network partition simulator** — `docker network disconnect` per osservare il comportamento CP vs AP in tempo reale.
 
+### Diagrammi di sequenza
+
+#### Percorso di successo (Saga completa)
+
+```mermaid
+sequenceDiagram
+    actor C as Client
+    participant OS as Order Service
+    participant PG_O as orders DB
+    participant K as Kafka
+    participant IS as Inventory Service
+    participant PG_I as inventory DB
+    participant PS as Payment Service
+    participant PG_P as payments DB
+    participant NS as Notification Service
+    participant R as Redis
+
+    C->>OS: POST /orders {product_id, quantity}
+
+    rect rgb(220, 240, 220)
+        Note over OS,PG_O: stessa transazione DB — Outbox pattern
+        OS->>PG_O: INSERT orders (status=pending)
+        OS->>PG_O: INSERT outbox (published=false)
+    end
+    OS-->>C: 201 {order_id, status: pending}
+
+    Note over OS: outbox_relay — poll ogni 1s
+    OS->>PG_O: SELECT FROM outbox FOR UPDATE SKIP LOCKED
+    OS->>K: produce → order.placed
+    OS->>PG_O: UPDATE outbox SET published=true
+
+    K->>IS: order.placed
+    rect rgb(220, 220, 240)
+        Note over IS,PG_I: SELECT FOR UPDATE — linearizability
+        IS->>PG_I: SELECT stock FOR UPDATE
+        IS->>PG_I: UPDATE products SET stock = stock - qty
+        IS->>PG_I: INSERT reservations
+    end
+    IS->>K: produce → inventory.reserved
+
+    K->>PS: inventory.reserved
+    rect rgb(240, 220, 220)
+        Note over PS,PG_P: idempotency key = order_id (UNIQUE constraint)
+        PS->>PG_P: INSERT INTO payments
+    end
+    PS->>K: produce → payment.processed
+
+    K->>NS: payment.processed
+    NS->>R: SETNX notif:sent:{order_id} TTL=3600s
+    NS-->>NS: [EMAIL] ordine confermato
+
+    K->>OS: payment.processed (saga_consumer)
+    OS->>PG_O: UPDATE orders SET status='confirmed'
+```
+
+#### Percorso di fallimento (stock insufficiente)
+
+```mermaid
+sequenceDiagram
+    actor C as Client
+    participant OS as Order Service
+    participant PG_O as orders DB
+    participant K as Kafka
+    participant IS as Inventory Service
+    participant PG_I as inventory DB
+
+    C->>OS: POST /orders {quantity: 100}
+
+    rect rgb(220, 240, 220)
+        Note over OS,PG_O: stessa transazione DB — Outbox pattern
+        OS->>PG_O: INSERT orders (status=pending)
+        OS->>PG_O: INSERT outbox (published=false)
+    end
+    OS-->>C: 201 {order_id, status: pending}
+
+    OS->>K: produce → order.placed
+    OS->>PG_O: UPDATE outbox SET published=true
+
+    K->>IS: order.placed
+    IS->>PG_I: SELECT stock FOR UPDATE
+    Note over IS,PG_I: stock(50) < quantity(100)
+    IS->>K: produce → inventory.failed
+
+    K->>OS: inventory.failed (saga_consumer)
+    OS->>PG_O: UPDATE orders SET status='failed'
+```
+
+#### At-least-once delivery e idempotency key
+
+Kafka garantisce *at-least-once*: in caso di crash del consumer prima del commit dell'offset, il messaggio viene riconsegnato. Il Payment Service lo gestisce con una `UNIQUE constraint` su `order_id`.
+
+```mermaid
+sequenceDiagram
+    participant K as Kafka
+    participant PS as Payment Service
+    participant PG_P as payments DB
+
+    Note over K,PS: prima consegna
+    K->>PS: inventory.reserved {order_id: X}
+    PS->>PG_P: INSERT INTO payments (order_id=X)
+    Note over PG_P: INSERT OK
+    PS->>K: produce → payment.processed
+    PS->>K: commit offset
+
+    Note over K,PS: ri-consegna (crash prima del commit)
+    K->>PS: inventory.reserved {order_id: X}
+    PS->>PG_P: INSERT INTO payments (order_id=X)
+    Note over PG_P: UniqueViolationError — no-op
+    Note over PS: nessun addebito doppio
+    PS->>K: commit offset
+```
+
 ### Concetti appresi per ogni componente
 
 **Order Service + Outbox pattern**
@@ -474,6 +586,22 @@ docker compose down
 # Ferma e rimuove i volumi (azzera lo stato dei database)
 docker compose down -v
 ```
+
+#### Cleanup (reset dati senza riavviare)
+
+Per ripetere un esperimento senza fermare lo stack, `cleanup.sh` svuota tutte le tabelle applicative e ripristina lo stock ai valori iniziali del seed:
+
+```bash
+./scripts/cleanup.sh
+```
+
+Cosa fa:
+- **orders DB** — truncate `orders` e `outbox`
+- **inventory DB** — truncate `reservations`; ripristina `products.stock` (abc → 50, xyz → 200)
+- **payments DB** — truncate `payments`
+- **Redis** — cancella le chiavi `notif:sent:*` usate per la deduplicazione delle notifiche
+
+I container rimangono attivi e gli offset Kafka restano intatti — i consumer group si riallineano automaticamente al riavvio dei servizi.
 
 ### Letture consigliate
 
