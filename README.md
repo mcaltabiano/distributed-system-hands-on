@@ -271,6 +271,7 @@ ecommerce-distributed/
 │   ├── order-service/              ← Python/FastAPI
 │   │   ├── main.py
 │   │   ├── outbox_relay.py         ← legge outbox table e pubblica su Kafka
+│   │   ├── saga_consumer.py        ← ascolta payment/inventory events e aggiorna lo status dell'ordine
 │   │   └── models.py
 │   ├── inventory-service/          ← Python/FastAPI
 │   │   ├── main.py
@@ -328,9 +329,37 @@ docker compose ps
 curl -X POST http://localhost:8001/orders \
   -H "Content-Type: application/json" \
   -d '{"product_id": "abc", "quantity": 1}'
+```
 
-# Osserva la riserva dell'inventario in tempo reale
+**Sequenza attesa nei log**
+
+```bash
 docker compose logs -f order-service inventory-service
+```
+
+```
+order-service     | INFO:outbox_relay:Relay published 1 events
+inventory-service | INFO:consumer:Published inventory.reserved for order <uuid>
+```
+
+**Verifica su PostgreSQL**
+
+```bash
+# Stato dell'ordine (pending → invariato in Fase 2, saga non ancora completa)
+docker compose exec postgres-orders psql -U app -d orders \
+  -c "SELECT id, status, created_at FROM orders ORDER BY created_at DESC LIMIT 5;"
+
+# Outbox: published=true conferma che il relay ha inviato l'evento a Kafka
+docker compose exec postgres-orders psql -U app -d orders \
+  -c "SELECT topic, key, published FROM outbox ORDER BY created_at DESC LIMIT 5;"
+
+# Inventario: la riserva è stata registrata
+docker compose exec postgres-inventory psql -U app -d inventory \
+  -c "SELECT order_id, product_id, quantity FROM reservations ORDER BY created_at DESC LIMIT 5;"
+
+# Stock residuo del prodotto
+docker compose exec postgres-inventory psql -U app -d inventory \
+  -c "SELECT id, name, stock FROM products;"
 ```
 
 #### Fase 3 — Payment Service + Notification Service (Saga completa)
@@ -346,9 +375,68 @@ docker compose ps
 curl -X POST http://localhost:8001/orders \
   -H "Content-Type: application/json" \
   -d '{"product_id": "abc", "quantity": 1}'
+```
 
-# Segui tutti i servizi in parallelo
+**Sequenza attesa nei log — percorso di successo**
+
+```bash
 docker compose logs -f order-service inventory-service payment-service notification-service
+```
+
+```
+order-service        | INFO:outbox_relay:Relay published 1 events
+inventory-service    | INFO:consumer:Published inventory.reserved for order <uuid>
+payment-service      | INFO:consumer:Payment processed for order <uuid> (1000 cents)
+notification-service | INFO:consumer:[EMAIL] Order <uuid> confirmed. Payment of €10.00 received. Thank you!
+order-service        | INFO:saga_consumer:Order <uuid> → confirmed (via payment.processed)
+```
+
+**Sequenza attesa nei log — percorso di fallimento (stock insufficiente)**
+
+```
+order-service        | INFO:outbox_relay:Relay published 1 events
+inventory-service    | INFO:consumer:Published inventory.failed for order <uuid>
+order-service        | INFO:saga_consumer:Order <uuid> → failed (via inventory.failed)
+```
+
+**Verifica su PostgreSQL e Redis**
+
+```bash
+# Stato finale dell'ordine (confirmed o failed)
+docker compose exec postgres-orders psql -U app -d orders \
+  -c "SELECT id, status, created_at FROM orders ORDER BY created_at DESC LIMIT 5;"
+
+# Riserve inventario e stock aggiornato
+docker compose exec postgres-inventory psql -U app -d inventory \
+  -c "SELECT order_id, product_id, quantity FROM reservations ORDER BY created_at DESC LIMIT 5;"
+
+docker compose exec postgres-inventory psql -U app -d inventory \
+  -c "SELECT id, name, stock FROM products;"
+
+# Pagamento registrato (idempotency key = order_id, UNIQUE constraint)
+docker compose exec postgres-payments psql -U app -d payments \
+  -c "SELECT order_id, amount_cents, created_at FROM payments ORDER BY created_at DESC LIMIT 5;"
+
+# Chiavi di deduplicazione notifiche in Redis (TTL 3600s)
+docker compose exec redis redis-cli keys "notif:sent:*"
+```
+
+**Verifica messaggi sui topic Kafka**
+
+```bash
+# Numero di messaggi per topic (formato topic:partizione:offset)
+docker compose exec kafka kafka-run-class kafka.tools.GetOffsetShell \
+  --bootstrap-server localhost:9092 --topic order.placed
+
+docker compose exec kafka kafka-run-class kafka.tools.GetOffsetShell \
+  --bootstrap-server localhost:9092 --topic inventory.reserved
+
+docker compose exec kafka kafka-run-class kafka.tools.GetOffsetShell \
+  --bootstrap-server localhost:9092 --topic payment.processed
+
+# Lag del consumer group dell'inventory (deve essere 0 se tutto è aggiornato)
+docker compose exec kafka kafka-consumer-groups \
+  --bootstrap-server localhost:9092 --describe --group inventory-service
 ```
 
 #### Fase 4 — Partition simulator e osservazioni

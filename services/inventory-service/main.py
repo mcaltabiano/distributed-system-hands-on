@@ -1,8 +1,11 @@
+import logging
 import os
 import asyncpg
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import asyncio
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
 from consumer import run_consumer
 

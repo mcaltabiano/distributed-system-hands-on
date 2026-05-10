@@ -1,7 +1,10 @@
 import asyncio
 import json
+import logging
 import os
 import uuid
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
 import asyncpg
 from fastapi import FastAPI, HTTPException
@@ -9,6 +12,7 @@ from contextlib import asynccontextmanager
 
 from models import OrderRequest, OrderResponse
 from outbox_relay import run_relay
+from saga_consumer import run_saga_consumer
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
@@ -20,8 +24,10 @@ async def lifespan(app: FastAPI):
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
     relay_task = asyncio.create_task(run_relay(pool))
+    saga_task  = asyncio.create_task(run_saga_consumer(pool))
     yield
     relay_task.cancel()
+    saga_task.cancel()
     await pool.close()
 
 
