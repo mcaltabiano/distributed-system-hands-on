@@ -2,6 +2,8 @@
 
 Teoria e pratica per un affondo su architetture distribuite event driven e pattern di resilienza, suggerito da Claude.
 
+![Distributed smurfs](imgs/smurfs.png)
+
 ## Guida teorica e progetto pratico
 
 ---
