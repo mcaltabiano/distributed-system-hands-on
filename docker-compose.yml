@@ -201,6 +201,7 @@ services:
 networks:
   ecommerce-net:
     driver: bridge
+    name: ecommerce-net
 
 volumes:
   postgres_orders_data:
