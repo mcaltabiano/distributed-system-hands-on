@@ -560,7 +560,7 @@ docker compose exec kafka kafka-consumer-groups \
 docker network disconnect ecommerce-net inventory-service
 
 # Lancia 100 ordini concorrenti
-python scripts/load_test.py --orders 100 --product-id abc --stock 50
+python scripts/load_test.py --orders 100 --product-id abc --quantity 1 --concurrency 20
 
 # Osservazioni attese:
 # - Order service: risponde sempre (AP) o blocca (CP)?

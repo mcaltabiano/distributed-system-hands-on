@@ -4,7 +4,7 @@ load_test.py — fire concurrent orders and report results.
 
 Usage:
     python scripts/load_test.py --orders 100 --product-id abc --quantity 1
-    python scripts/load_test.py --orders 100 --product-id abc --stock 50
+    python scripts/load_test.py --orders 100 --product-id abc --quantity 1 --concurrency 20
 
 What to observe:
   - With stock=50 and orders=100, exactly 50 should succeed (CP guarantee).
